@@ -1,4 +1,4 @@
-use crate::app::{App, FileEntry, InputMode};
+use crate::app::{App, FileEntry, InputMode, MouseAreas};
 use chrono::{DateTime, Local};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,19 +8,66 @@ use ratatui::{
     Frame,
 };
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let has_tabs = app.tabs.len() > 1;
+    let tab_bar_height = if has_tabs { 1 } else { 0 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Breadcrumb
-            Constraint::Min(5),    // Three panes
-            Constraint::Length(2), // Info + status bar
+            Constraint::Length(tab_bar_height), // Tab bar (only if multiple tabs)
+            Constraint::Length(1),              // Breadcrumb
+            Constraint::Min(5),                 // Three panes
+            Constraint::Length(2),              // Info + status bar
         ])
         .split(f.area());
 
-    draw_breadcrumb(f, app, chunks[0]);
-    draw_panes(f, app, chunks[1]);
-    draw_status_bar(f, app, chunks[2]);
+    // Reset mouse areas
+    app.mouse_areas = MouseAreas::default();
+
+    if has_tabs {
+        draw_tab_bar(f, app, chunks[0]);
+    }
+    draw_breadcrumb(f, app, chunks[1]);
+    draw_panes(f, app, chunks[2]);
+    draw_status_bar(f, app, chunks[3]);
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut spans = Vec::new();
+    let mut tab_positions = Vec::new();
+    let mut x = area.x;
+
+    for (i, tab) in app.tabs.iter().enumerate() {
+        let title = tab.tab_title();
+        let label = format!(" {} {} ", i + 1, title);
+        let width = label.len() as u16;
+
+        tab_positions.push((x, width, i));
+
+        let style = if i == app.active_tab {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+        x += width + 1;
+    }
+
+    // Hint
+    spans.push(Span::styled(
+        " Ctrl-T:new  Ctrl-W:close  Ctrl-←→:switch",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    app.mouse_areas.tab_bar = Some((area.x, area.y, area.width, area.height));
+    app.mouse_areas.tab_positions = tab_positions;
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
@@ -34,7 +81,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_panes(f: &mut Frame, app: &App, area: Rect) {
+fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -51,11 +98,11 @@ fn draw_panes(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_parent_pane(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
-        .parent_entries
+        .parent_entries()
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let style = if i == app.parent_cursor {
+            let style = if i == app.parent_cursor() {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
                 entry_style(entry)
@@ -68,14 +115,20 @@ fn draw_parent_pane(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_current_pane(f: &mut Frame, app: &App, area: Rect) {
+fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
+    // Record mouse area for click handling
+    app.mouse_areas.current_pane = Some((area.x, area.y, area.width, area.height));
+
     let visible = app.visible_entries();
+    let cursor = app.cursor();
+    let selected_set = app.selected().clone();
+
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let selected = app.selected.contains(&entry.path);
-            let is_cursor = i == app.cursor;
+            let selected = selected_set.contains(&entry.path);
+            let is_cursor = i == cursor;
             let mut style = if is_cursor {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
@@ -108,7 +161,7 @@ fn draw_current_pane(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview_pane(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
-        .preview_lines
+        .preview_lines()
         .iter()
         .map(|pl| {
             let color = match pl.style {
@@ -133,7 +186,6 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    // Info bar for selected file
     let info = if let Some(entry) = app.selected_entry() {
         let size = human_size(entry.size);
         let modified = entry
@@ -157,7 +209,12 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
-    // Status bar
+    let tab_info = if app.tabs.len() > 1 {
+        format!(" Tab {}/{} │", app.active_tab + 1, app.tabs.len())
+    } else {
+        String::new()
+    };
+
     let status = if let Some(msg) = &app.status_message {
         msg.clone()
     } else if app.input_mode != InputMode::Normal {
@@ -171,10 +228,11 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     } else {
         format!(
-            " {} files │ {} selected │ Sort: {:?}",
+            "{} {} files │ {} selected │ Sort: {:?}",
+            tab_info,
             app.file_count(),
             app.selection_count(),
-            app.config.sort_by,
+            app.sort_by(),
         )
     };
     f.render_widget(

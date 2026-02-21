@@ -50,10 +50,18 @@ fn run_app(
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if app.handle_key(key)? {
-                return Ok(());
+        match event::read()? {
+            Event::Key(key) => {
+                if app.handle_key(key)? {
+                    return Ok(());
+                }
             }
+            Event::Mouse(mouse) => {
+                if app.handle_mouse(mouse)? {
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
     }
 }
