@@ -1,5 +1,5 @@
 use crate::config::{Config, SortBy};
-use crate::file_ops::{self, OpKind, PendingOp};
+use crate::file_ops::{self, OpKind, PendingOp, SearchResult};
 use crate::git_status::{self, GitFileStatus};
 use crate::preview::{self, PreviewLine};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -7,6 +7,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -31,6 +33,9 @@ pub enum InputMode {
     CreateDir,
     Bookmark,
     JumpBookmark,
+    Chmod,
+    Search,
+    SearchResults,
 }
 
 /// A node in the tree view
@@ -294,6 +299,10 @@ pub struct App {
     pub pending_p: bool,
     /// Layout areas for mouse hit-testing (set during draw)
     pub mouse_areas: MouseAreas,
+    /// Recursive search results
+    pub search_results: Vec<SearchResult>,
+    /// Cursor position in search results
+    pub search_cursor: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -330,6 +339,8 @@ impl App {
             pending_y: false,
             pending_p: false,
             mouse_areas: MouseAreas::default(),
+            search_results: Vec::new(),
+            search_cursor: 0,
         })
     }
 
@@ -521,6 +532,9 @@ impl App {
             }
             InputMode::Bookmark => self.handle_bookmark_key(key),
             InputMode::JumpBookmark => self.handle_jump_bookmark_key(key),
+            InputMode::Chmod => self.handle_chmod_key(key),
+            InputMode::Search => self.handle_search_key(key),
+            InputMode::SearchResults => self.handle_search_results_key(key),
         }
     }
 
@@ -845,6 +859,26 @@ impl App {
                 self.input_mode = InputMode::JumpBookmark;
                 self.status_message = Some("Jump to bookmark: ".to_string());
             }
+            KeyCode::Char('c') => {
+                #[cfg(unix)]
+                if let Some(entry) = self.tab().selected_entry() {
+                    if let Ok(meta) = std::fs::metadata(&entry.path) {
+                        let mode = meta.permissions().mode() & 0o777;
+                        self.input_buffer = format!("{:o}", mode);
+                        self.input_mode = InputMode::Chmod;
+                        self.status_message = Some(format!("chmod (octal): {}", self.input_buffer));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    self.status_message = Some("chmod not supported on this platform".to_string());
+                }
+            }
+            KeyCode::Char('F') => {
+                self.input_mode = InputMode::Search;
+                self.input_buffer.clear();
+                self.status_message = Some("Search: ".to_string());
+            }
             KeyCode::Char('t') => {
                 self.tab_mut().toggle_tree_mode();
                 let mode = if self.tab().tree_mode { "Tree" } else { "List" };
@@ -982,6 +1016,136 @@ impl App {
             } else {
                 self.status_message = Some(format!("No bookmark '{c}'"));
             }
+        }
+        Ok(false)
+    }
+
+    fn handle_chmod_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                self.status_message = None;
+            }
+            KeyCode::Enter => {
+                let mode_str = self.input_buffer.clone();
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                if let Some(entry) = self.tab().selected_entry() {
+                    match file_ops::chmod_file(&entry.path, &mode_str) {
+                        Ok(_) => self.status_message = Some(format!("chmod {mode_str} applied")),
+                        Err(e) => self.status_message = Some(format!("chmod error: {e}")),
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+                self.status_message = Some(format!("chmod (octal): {}", self.input_buffer));
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && c < '8' => {
+                if self.input_buffer.len() < 4 {
+                    self.input_buffer.push(c);
+                    self.status_message = Some(format!("chmod (octal): {}", self.input_buffer));
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                self.status_message = None;
+            }
+            KeyCode::Enter => {
+                let pattern = self.input_buffer.clone();
+                self.input_buffer.clear();
+                if pattern.is_empty() {
+                    self.input_mode = InputMode::Normal;
+                    self.status_message = None;
+                } else {
+                    let dir = self.tab().current_dir.clone();
+                    self.search_results = file_ops::search_recursive(&dir, &pattern, 200);
+                    self.search_cursor = 0;
+                    if self.search_results.is_empty() {
+                        self.input_mode = InputMode::Normal;
+                        self.status_message = Some(format!("No results for \"{pattern}\""));
+                    } else {
+                        let count = self.search_results.len();
+                        self.input_mode = InputMode::SearchResults;
+                        self.status_message = Some(format!("{count} results for \"{pattern}\" — j/k navigate, Enter open, Esc close"));
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+                self.status_message = Some(format!("Search: {}", self.input_buffer));
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+                self.status_message = Some(format!("Search: {}", self.input_buffer));
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_search_results_key(
+        &mut self,
+        key: KeyEvent,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.input_mode = InputMode::Normal;
+                self.search_results.clear();
+                self.status_message = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.search_cursor < self.search_results.len().saturating_sub(1) {
+                    self.search_cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.search_cursor = self.search_cursor.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(result) = self.search_results.get(self.search_cursor).cloned() {
+                    // Navigate to the file's parent directory
+                    if let Some(parent) = result.path.parent() {
+                        let tab = self.tab_mut();
+                        tab.current_dir = parent.to_path_buf();
+                        tab.cursor = 0;
+                        tab.refresh()?;
+                        // Try to select the file
+                        let file_name = result
+                            .path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if let Some(pos) = tab
+                            .filtered_entries
+                            .iter()
+                            .position(|&idx| tab.entries[idx].name == file_name)
+                        {
+                            tab.cursor = pos;
+                            tab.update_preview();
+                        }
+                    }
+                    self.input_mode = InputMode::Normal;
+                    self.search_results.clear();
+                    self.status_message = Some(format!("Opened: {}", result.path.display()));
+                }
+            }
+            KeyCode::Char('G') => {
+                self.search_cursor = self.search_results.len().saturating_sub(1);
+            }
+            KeyCode::Char('g') => {
+                self.search_cursor = 0;
+            }
+            _ => {}
         }
         Ok(false)
     }
@@ -1386,5 +1550,152 @@ mod tests {
         })
         .unwrap();
         assert_eq!(app.cursor(), 0);
+    }
+
+    // Chmod tests
+    #[test]
+    fn test_chmod_mode_entry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        let mut app = make_app(&tmp);
+        // Enter chmod mode
+        app.input_mode = InputMode::Chmod;
+        app.input_buffer = "755".to_string();
+        // Simulate Enter
+        app.handle_chmod_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_chmod_only_accepts_octal() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Chmod;
+        app.input_buffer.clear();
+        // '8' should not be accepted (not octal)
+        app.handle_chmod_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.input_buffer.is_empty());
+        // '7' should be accepted
+        app.handle_chmod_key(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_buffer, "7");
+    }
+
+    #[test]
+    fn test_chmod_esc_cancels() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Chmod;
+        app.input_buffer = "644".to_string();
+        app.handle_chmod_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    // Search tests
+    #[test]
+    fn test_search_mode_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Search;
+        app.input_buffer.clear();
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_buffer, "h");
+    }
+
+    #[test]
+    fn test_search_finds_results() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("needle.txt"), "find the needle here").unwrap();
+        fs::write(dir.join("other.txt"), "nothing here").unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Search;
+        app.input_buffer = "needle".to_string();
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::SearchResults);
+        assert!(!app.search_results.is_empty());
+    }
+
+    #[test]
+    fn test_search_no_results() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Search;
+        app.input_buffer = "zzzznotfound".to_string();
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_results.is_empty());
+    }
+
+    #[test]
+    fn test_search_results_navigation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("a.txt"), "line1\nline2\nline3").unwrap();
+        let mut app = make_app(&tmp);
+        app.input_mode = InputMode::Search;
+        app.input_buffer = "line".to_string();
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::SearchResults);
+        assert!(app.search_results.len() >= 3);
+        assert_eq!(app.search_cursor, 0);
+        // Navigate down
+        app.handle_search_results_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.search_cursor, 1);
+        // Navigate up
+        app.handle_search_results_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.search_cursor, 0);
+    }
+
+    #[test]
+    fn test_search_results_esc() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("a.txt"), "test content").unwrap();
+        let mut app = make_app(&tmp);
+        app.search_results = vec![file_ops::SearchResult {
+            path: dir.join("a.txt"),
+            line_number: 1,
+            line_text: "test content".to_string(),
+        }];
+        app.search_cursor = 0;
+        app.input_mode = InputMode::SearchResults;
+        app.handle_search_results_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.search_results.is_empty());
+    }
+
+    #[test]
+    fn test_search_results_enter_navigates() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("target.txt"), "found it").unwrap();
+        let mut app = make_app(&tmp);
+        app.search_results = vec![file_ops::SearchResult {
+            path: sub.join("target.txt"),
+            line_number: 1,
+            line_text: "found it".to_string(),
+        }];
+        app.search_cursor = 0;
+        app.input_mode = InputMode::SearchResults;
+        app.handle_search_results_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(*app.tab().current_dir, sub);
     }
 }

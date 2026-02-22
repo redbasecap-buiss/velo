@@ -82,6 +82,12 @@ fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.input_mode == InputMode::SearchResults {
+        // Full-width search results view
+        draw_search_results(f, app, area);
+        return;
+    }
+
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -210,6 +216,45 @@ fn draw_tree_pane(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
+fn draw_search_results(f: &mut Frame, app: &App, area: Rect) {
+    let visible_height = area.height.saturating_sub(2) as usize; // borders
+    let scroll = if app.search_cursor >= visible_height {
+        app.search_cursor - visible_height + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = app
+        .search_results
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|(i, result)| {
+            let is_cursor = i == app.search_cursor;
+            let text = format!(
+                "{}:{} {}",
+                result.path.display(),
+                result.line_number,
+                result.line_text.trim()
+            );
+            let style = if is_cursor {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "🔍 Search Results ({} matches)",
+        app.search_results.len()
+    ));
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
 fn draw_preview_pane(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .preview_lines()
@@ -275,7 +320,16 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             InputMode::CreateDir => format!("New dir: {}", app.input_buffer),
             InputMode::Bookmark => "Bookmark key?".to_string(),
             InputMode::JumpBookmark => "Jump to bookmark?".to_string(),
-            _ => String::new(),
+            InputMode::Chmod => format!("chmod (octal): {}", app.input_buffer),
+            InputMode::Search => format!("Search: {}", app.input_buffer),
+            InputMode::SearchResults => {
+                format!(
+                    "Search results: {}/{} — j/k navigate, Enter open, Esc close",
+                    app.search_cursor + 1,
+                    app.search_results.len()
+                )
+            }
+            InputMode::Normal | InputMode::Filter => String::new(),
         }
     } else {
         format!(

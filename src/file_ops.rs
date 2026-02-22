@@ -70,6 +70,145 @@ pub fn copy_content_to_clipboard(path: &Path) -> Result<(), String> {
     clipboard.set_text(content).map_err(|e| e.to_string())
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn get_permissions(path: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    Ok(meta.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn get_permissions(_path: &Path) -> Result<u32, String> {
+    Err("Permissions not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, perms).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn set_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
+    Err("Permissions not supported on this platform".to_string())
+}
+
+/// Format a unix permission mode as rwx string (e.g., "rwxr-xr--")
+#[allow(dead_code)]
+pub fn format_permissions(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        s.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
+/// Parse an octal string like "755" into a mode
+#[allow(dead_code)]
+pub fn parse_octal_mode(s: &str) -> Option<u32> {
+    u32::from_str_radix(s, 8).ok().filter(|&m| m <= 0o7777)
+}
+
+/// Toggle a specific permission bit. Position 0-8 maps to rwxrwxrwx.
+#[allow(dead_code)]
+pub fn toggle_permission_bit(mode: u32, position: usize) -> u32 {
+    if position > 8 {
+        return mode;
+    }
+    // position 0 = owner r (bit 8), position 8 = other x (bit 0)
+    let bit = 8 - position;
+    mode ^ (1 << bit)
+}
+
+/// Change file permissions (octal string like "755")
+pub fn chmod_file(path: &Path, mode_str: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = u32::from_str_radix(mode_str, 8)
+            .map_err(|_| format!("Invalid octal mode: {mode_str}"))?;
+        let perms = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode_str);
+        Err("chmod not supported on this platform".into())
+    }
+}
+
+/// Recursively search for a pattern in files under a directory
+pub fn search_recursive(dir: &Path, pattern: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let pattern_lower = pattern.to_lowercase();
+    search_recursive_inner(dir, &pattern_lower, max_results, &mut results);
+    results
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub path: PathBuf,
+    pub line_number: usize,
+    pub line_text: String,
+}
+
+fn search_recursive_inner(
+    dir: &Path,
+    pattern: &str,
+    max_results: usize,
+    results: &mut Vec<SearchResult>,
+) {
+    if results.len() >= max_results {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if results.len() >= max_results {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            search_recursive_inner(&path, pattern, max_results, results);
+        } else if path.is_file() {
+            // Skip large/binary files
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if size > 1024 * 1024 || size == 0 {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                for (i, line) in content.lines().enumerate() {
+                    if results.len() >= max_results {
+                        return;
+                    }
+                    if line.to_lowercase().contains(pattern) {
+                        results.push(SearchResult {
+                            path: path.clone(),
+                            line_number: i + 1,
+                            line_text: line.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
