@@ -33,6 +33,15 @@ pub enum InputMode {
     JumpBookmark,
 }
 
+/// A node in the tree view
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub entry: FileEntry,
+    pub depth: usize,
+    pub expanded: bool,
+    pub has_children: bool,
+}
+
 /// Per-tab state
 #[derive(Debug, Clone)]
 pub struct Tab {
@@ -48,6 +57,10 @@ pub struct Tab {
     pub selected: HashSet<PathBuf>,
     pub git_statuses: HashMap<String, GitFileStatus>,
     pub filter_text: String,
+    pub tree_mode: bool,
+    pub tree_nodes: Vec<TreeNode>,
+    pub tree_cursor: usize,
+    pub tree_expanded: HashSet<PathBuf>,
 }
 
 impl Tab {
@@ -69,6 +82,10 @@ impl Tab {
             selected: HashSet::new(),
             git_statuses: HashMap::new(),
             filter_text: String::new(),
+            tree_mode: false,
+            tree_nodes: Vec::new(),
+            tree_cursor: 0,
+            tree_expanded: HashSet::new(),
         };
         tab.refresh()?;
         Ok(tab)
@@ -182,6 +199,75 @@ impl Tab {
 
     pub fn breadcrumb(&self) -> String {
         self.current_dir.display().to_string()
+    }
+
+    pub fn toggle_tree_mode(&mut self) {
+        self.tree_mode = !self.tree_mode;
+        if self.tree_mode {
+            self.rebuild_tree();
+        }
+    }
+
+    pub fn rebuild_tree(&mut self) {
+        self.tree_nodes.clear();
+        self.build_tree_recursive(&self.current_dir.clone(), 0);
+        if self.tree_cursor >= self.tree_nodes.len() {
+            self.tree_cursor = self.tree_nodes.len().saturating_sub(1);
+        }
+        self.update_preview_for_tree();
+    }
+
+    fn build_tree_recursive(&mut self, dir: &Path, depth: usize) {
+        let mut entries = read_dir(dir, self.show_hidden).unwrap_or_default();
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        for entry in entries {
+            let is_dir = entry.is_dir;
+            let path = entry.path.clone();
+            let expanded = self.tree_expanded.contains(&path);
+            let has_children = is_dir
+                && fs::read_dir(&path)
+                    .map(|mut rd| rd.next().is_some())
+                    .unwrap_or(false);
+            self.tree_nodes.push(TreeNode {
+                entry,
+                depth,
+                expanded,
+                has_children,
+            });
+            if is_dir && expanded && depth < 5 {
+                self.build_tree_recursive(&path, depth + 1);
+            }
+        }
+    }
+
+    pub fn tree_toggle_expand(&mut self) {
+        if let Some(node) = self.tree_nodes.get(self.tree_cursor) {
+            if node.entry.is_dir {
+                let path = node.entry.path.clone();
+                if self.tree_expanded.contains(&path) {
+                    self.tree_expanded.remove(&path);
+                } else {
+                    self.tree_expanded.insert(path);
+                }
+                self.rebuild_tree();
+            }
+        }
+    }
+
+    pub fn selected_tree_entry(&self) -> Option<&FileEntry> {
+        self.tree_nodes.get(self.tree_cursor).map(|n| &n.entry)
+    }
+
+    fn update_preview_for_tree(&mut self) {
+        if let Some(entry) = self.selected_tree_entry() {
+            self.preview_lines = preview::preview_path(&entry.path);
+        } else {
+            self.preview_lines.clear();
+        }
     }
 
     pub fn tab_title(&self) -> String {
@@ -374,6 +460,23 @@ impl App {
         // Tab keybinds (work in normal mode)
         if self.input_mode == InputMode::Normal && key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('y') => {
+                    let entry = if self.tab().tree_mode {
+                        self.tab().selected_tree_entry().cloned()
+                    } else {
+                        self.tab().selected_entry().cloned()
+                    };
+                    if let Some(entry) = entry {
+                        match file_ops::copy_content_to_clipboard(&entry.path) {
+                            Ok(_) => {
+                                self.status_message =
+                                    Some(format!("Content copied: {}", entry.name))
+                            }
+                            Err(e) => self.status_message = Some(format!("Error: {e}")),
+                        }
+                    }
+                    return Ok(false);
+                }
                 KeyCode::Char('t') => {
                     self.new_tab()?;
                     self.status_message = Some(format!("Tab {} opened", self.active_tab + 1));
@@ -478,14 +581,51 @@ impl App {
         Ok(false)
     }
 
+    fn handle_tree_common_key(
+        &mut self,
+        key: KeyEvent,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // Handle keys that work the same in tree mode as normal (t, Y, sort, etc.)
+        match key.code {
+            KeyCode::Char('t') => {
+                self.tab_mut().toggle_tree_mode();
+                let mode = if self.tab().tree_mode { "Tree" } else { "List" };
+                self.status_message = Some(format!("View: {mode}"));
+            }
+            KeyCode::Char('Y') => {
+                if let Some(entry) = self.tab().selected_tree_entry().cloned() {
+                    match file_ops::copy_path_to_clipboard(&entry.path) {
+                        Ok(_) => {
+                            self.status_message =
+                                Some(format!("Path copied: {}", entry.path.display()))
+                        }
+                        Err(e) => self.status_message = Some(format!("Clipboard error: {e}")),
+                    }
+                }
+            }
+            KeyCode::Char('.') => {
+                let new_hidden = !self.tab().show_hidden;
+                self.tab_mut().show_hidden = new_hidden;
+                self.tab_mut().rebuild_tree();
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
         self.status_message = None;
 
         if self.pending_g {
             self.pending_g = false;
             if key.code == KeyCode::Char('g') {
-                self.tab_mut().cursor = 0;
-                self.tab_mut().update_preview();
+                if self.tab().tree_mode {
+                    self.tab_mut().tree_cursor = 0;
+                    self.tab_mut().update_preview_for_tree();
+                } else {
+                    self.tab_mut().cursor = 0;
+                    self.tab_mut().update_preview();
+                }
             }
             return Ok(false);
         }
@@ -507,6 +647,79 @@ impl App {
             self.pending_p = false;
             if key.code == KeyCode::Char('p') {
                 self.paste()?;
+            }
+            return Ok(false);
+        }
+
+        // Tree mode navigation
+        if self.tab().tree_mode {
+            match key.code {
+                KeyCode::Char('q') => return Ok(true),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let tab = self.tab_mut();
+                    if tab.tree_cursor < tab.tree_nodes.len().saturating_sub(1) {
+                        tab.tree_cursor += 1;
+                        tab.update_preview_for_tree();
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let tab = self.tab_mut();
+                    if tab.tree_cursor > 0 {
+                        tab.tree_cursor -= 1;
+                        tab.update_preview_for_tree();
+                    }
+                }
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                    if let Some(entry) = self.tab().selected_tree_entry().cloned() {
+                        if entry.is_dir {
+                            self.tab_mut().tree_toggle_expand();
+                        } else {
+                            let _ = open::that(&entry.path);
+                        }
+                    }
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    // Collapse current dir or go to parent node
+                    if let Some(node) = self.tab().tree_nodes.get(self.tab().tree_cursor).cloned() {
+                        if node.entry.is_dir && node.expanded {
+                            self.tab_mut().tree_toggle_expand();
+                        } else if node.depth > 0 {
+                            // Find parent node
+                            let tab = self.tab_mut();
+                            for i in (0..tab.tree_cursor).rev() {
+                                if tab.tree_nodes[i].depth < node.depth {
+                                    tab.tree_cursor = i;
+                                    tab.update_preview_for_tree();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('g') => self.pending_g = true,
+                KeyCode::Char('G') => {
+                    let len = self.tab().tree_nodes.len();
+                    let tab = self.tab_mut();
+                    tab.tree_cursor = len.saturating_sub(1);
+                    tab.update_preview_for_tree();
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = self.tab().selected_tree_entry().cloned() {
+                        let tab = self.tab_mut();
+                        if tab.selected.contains(&entry.path) {
+                            tab.selected.remove(&entry.path);
+                        } else {
+                            tab.selected.insert(entry.path);
+                        }
+                        if tab.tree_cursor < tab.tree_nodes.len().saturating_sub(1) {
+                            tab.tree_cursor += 1;
+                            tab.update_preview_for_tree();
+                        }
+                    }
+                }
+                _ => {
+                    return self.handle_tree_common_key(key);
+                }
             }
             return Ok(false);
         }
@@ -631,6 +844,27 @@ impl App {
             KeyCode::Char('\'') => {
                 self.input_mode = InputMode::JumpBookmark;
                 self.status_message = Some("Jump to bookmark: ".to_string());
+            }
+            KeyCode::Char('t') => {
+                self.tab_mut().toggle_tree_mode();
+                let mode = if self.tab().tree_mode { "Tree" } else { "List" };
+                self.status_message = Some(format!("View: {mode}"));
+            }
+            KeyCode::Char('Y') => {
+                let entry = if self.tab().tree_mode {
+                    self.tab().selected_tree_entry().cloned()
+                } else {
+                    self.tab().selected_entry().cloned()
+                };
+                if let Some(entry) = entry {
+                    match file_ops::copy_path_to_clipboard(&entry.path) {
+                        Ok(_) => {
+                            self.status_message =
+                                Some(format!("Path copied: {}", entry.path.display()))
+                        }
+                        Err(e) => self.status_message = Some(format!("Clipboard error: {e}")),
+                    }
+                }
             }
             _ => {}
         }
@@ -1040,6 +1274,93 @@ mod tests {
         let app = make_app(&tmp);
         let title = app.tab().tab_title();
         assert!(!title.is_empty());
+    }
+
+    #[test]
+    fn test_tree_mode_toggle() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("a.txt"), "hello").unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+        fs::write(dir.join("subdir").join("b.txt"), "world").unwrap();
+        let mut app = make_app(&tmp);
+        assert!(!app.tab().tree_mode);
+        app.tab_mut().toggle_tree_mode();
+        assert!(app.tab().tree_mode);
+        assert!(!app.tab().tree_nodes.is_empty());
+        // Should have subdir and a.txt at minimum
+        let names: Vec<_> = app
+            .tab()
+            .tree_nodes
+            .iter()
+            .map(|n| n.entry.name.clone())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"subdir".to_string()));
+    }
+
+    #[test]
+    fn test_tree_expand_collapse() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+        fs::write(dir.join("subdir").join("inner.txt"), "").unwrap();
+        let mut app = make_app(&tmp);
+        app.tab_mut().toggle_tree_mode();
+        // Find subdir
+        let sub_idx = app
+            .tab()
+            .tree_nodes
+            .iter()
+            .position(|n| n.entry.name == "subdir")
+            .unwrap();
+        app.tab_mut().tree_cursor = sub_idx;
+        let initial_count = app.tab().tree_nodes.len();
+        // Expand
+        app.tab_mut().tree_toggle_expand();
+        assert!(app.tab().tree_nodes.len() > initial_count);
+        // inner.txt should now be visible
+        assert!(app
+            .tab()
+            .tree_nodes
+            .iter()
+            .any(|n| n.entry.name == "inner.txt"));
+        // Collapse
+        let sub_idx = app
+            .tab()
+            .tree_nodes
+            .iter()
+            .position(|n| n.entry.name == "subdir")
+            .unwrap();
+        app.tab_mut().tree_cursor = sub_idx;
+        app.tab_mut().tree_toggle_expand();
+        assert!(!app
+            .tab()
+            .tree_nodes
+            .iter()
+            .any(|n| n.entry.name == "inner.txt"));
+    }
+
+    #[test]
+    fn test_tree_toggle_back_to_list() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let mut app = make_app(&tmp);
+        app.tab_mut().toggle_tree_mode();
+        assert!(app.tab().tree_mode);
+        app.tab_mut().toggle_tree_mode();
+        assert!(!app.tab().tree_mode);
+    }
+
+    #[test]
+    fn test_tree_selected_entry() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("file.txt"), "content").unwrap();
+        let mut app = make_app(&tmp);
+        app.tab_mut().toggle_tree_mode();
+        let entry = app.tab().selected_tree_entry();
+        assert!(entry.is_some());
     }
 
     #[test]

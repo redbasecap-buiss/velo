@@ -119,6 +119,11 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
     // Record mouse area for click handling
     app.mouse_areas.current_pane = Some((area.x, area.y, area.width, area.height));
 
+    if app.tab().tree_mode {
+        draw_tree_pane(f, app, area);
+        return;
+    }
+
     let visible = app.visible_entries();
     let cursor = app.cursor();
     let selected_set = app.selected().clone();
@@ -155,6 +160,52 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
         "Files".to_string()
     };
     let block = Block::default().borders(Borders::ALL).title(title);
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+fn draw_tree_pane(f: &mut Frame, app: &App, area: Rect) {
+    let selected_set = app.selected().clone();
+    let tree_cursor = app.tab().tree_cursor;
+
+    let items: Vec<ListItem> = app
+        .tab()
+        .tree_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let is_cursor = i == tree_cursor;
+            let selected = selected_set.contains(&node.entry.path);
+            let mut style = if is_cursor {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                entry_style(&node.entry)
+            };
+            if selected {
+                style = style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+            }
+
+            let indent = "  ".repeat(node.depth);
+            let icon = if node.entry.is_dir {
+                if node.expanded {
+                    "▼ "
+                } else if node.has_children {
+                    "▶ "
+                } else {
+                    "▷ "
+                }
+            } else {
+                "  "
+            };
+            let mut name = entry_display_name(&node.entry);
+            if selected && !is_cursor {
+                name = format!("* {name}");
+            }
+            ListItem::new(format!("{indent}{icon}{name}")).style(style)
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::ALL).title("🌳 Tree");
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }

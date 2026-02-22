@@ -55,6 +55,21 @@ pub fn create_dir(dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+pub fn copy_path_to_clipboard(path: &Path) -> Result<(), String> {
+    let text = path.display().to_string();
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text).map_err(|e| e.to_string())
+}
+
+pub fn copy_content_to_clipboard(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Err("Cannot copy directory content".to_string());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(content).map_err(|e| e.to_string())
+}
+
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
