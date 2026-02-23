@@ -2,6 +2,8 @@ use crate::config::{Config, SortBy};
 use crate::file_ops::{self, OpKind, PendingOp, SearchResult};
 use crate::git_status::{self, GitFileStatus};
 use crate::preview::{self, PreviewLine};
+use crate::theme::{Theme, ThemeName};
+use crate::undo::{self, UndoStack};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -303,6 +305,11 @@ pub struct App {
     pub search_results: Vec<SearchResult>,
     /// Cursor position in search results
     pub search_cursor: usize,
+    /// Current theme
+    pub theme_name: ThemeName,
+    pub theme: Theme,
+    /// Undo/redo stack
+    pub undo_stack: UndoStack,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,7 +335,7 @@ impl App {
         Ok(Self {
             tabs: vec![tab],
             active_tab: 0,
-            config,
+            config: config.clone(),
             pending_op: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
@@ -341,6 +348,9 @@ impl App {
             mouse_areas: MouseAreas::default(),
             search_results: Vec::new(),
             search_cursor: 0,
+            theme_name: config.theme,
+            theme: Theme::from_name(config.theme),
+            undo_stack: UndoStack::new(),
         })
     }
 
@@ -900,6 +910,25 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('T') => {
+                self.theme_name = self.theme_name.next();
+                self.theme = Theme::from_name(self.theme_name);
+                self.status_message = Some(format!("Theme: {}", self.theme_name.label()));
+            }
+            KeyCode::Char('u') => match self.undo_stack.undo() {
+                Ok(msg) => {
+                    self.status_message = Some(msg);
+                    self.tab_mut().refresh()?;
+                }
+                Err(e) => self.status_message = Some(e),
+            },
+            KeyCode::Char('U') => match self.undo_stack.redo() {
+                Ok(msg) => {
+                    self.status_message = Some(msg);
+                    self.tab_mut().refresh()?;
+                }
+                Err(e) => self.status_message = Some(e),
+            },
             _ => {}
         }
         Ok(false)
@@ -959,18 +988,29 @@ impl App {
                 match mode {
                     InputMode::Rename => {
                         if let Some(entry) = self.tab().selected_entry() {
+                            let old_path = entry.path.clone();
                             match file_ops::rename_file(&entry.path, &name) {
-                                Ok(_) => self.status_message = Some("Renamed".to_string()),
+                                Ok(new_path) => {
+                                    self.undo_stack
+                                        .push(undo::record_rename(&old_path, &new_path));
+                                    self.status_message = Some("Renamed".to_string());
+                                }
                                 Err(e) => self.status_message = Some(format!("Error: {e}")),
                             }
                         }
                     }
                     InputMode::CreateFile => match file_ops::create_file(&current_dir, &name) {
-                        Ok(_) => self.status_message = Some("File created".to_string()),
+                        Ok(path) => {
+                            self.undo_stack.push(undo::record_create_file(&path));
+                            self.status_message = Some("File created".to_string());
+                        }
                         Err(e) => self.status_message = Some(format!("Error: {e}")),
                     },
                     InputMode::CreateDir => match file_ops::create_dir(&current_dir, &name) {
-                        Ok(_) => self.status_message = Some("Directory created".to_string()),
+                        Ok(path) => {
+                            self.undo_stack.push(undo::record_create_dir(&path));
+                            self.status_message = Some("Directory created".to_string());
+                        }
                         Err(e) => self.status_message = Some(format!("Error: {e}")),
                     },
                     _ => {}
@@ -1198,8 +1238,16 @@ impl App {
                     OpKind::Copy => file_ops::copy_file(src, &current_dir),
                     OpKind::Move => file_ops::move_file(src, &current_dir),
                 };
-                if result.is_ok() {
+                if let Ok(dest) = result {
                     count += 1;
+                    match op.kind {
+                        OpKind::Copy => {
+                            self.undo_stack.push(undo::record_copy(&dest));
+                        }
+                        OpKind::Move => {
+                            self.undo_stack.push(undo::record_move(src, &dest));
+                        }
+                    }
                 }
             }
             self.tab_mut().selected.clear();

@@ -1,3 +1,4 @@
+use crate::theme::ThemeName;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +13,8 @@ pub struct Config {
     pub colors: ColorConfig,
     #[serde(default)]
     pub keybinds: HashMap<String, String>,
+    #[serde(default = "default_theme")]
+    pub theme: ThemeName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +67,9 @@ fn default_symlink_color() -> String {
 fn default_selected_color() -> String {
     "yellow".into()
 }
+fn default_theme() -> ThemeName {
+    ThemeName::Default
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -72,6 +78,7 @@ impl Default for Config {
             sort_by: SortBy::Name,
             colors: ColorConfig::default(),
             keybinds: HashMap::new(),
+            theme: ThemeName::Default,
         }
     }
 }

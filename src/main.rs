@@ -3,7 +3,9 @@ mod config;
 mod file_ops;
 mod git_status;
 mod preview;
+mod theme;
 mod ui;
+mod undo;
 
 use app::App;
 use config::Config;

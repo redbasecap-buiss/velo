@@ -34,6 +34,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = &app.theme;
     let mut spans = Vec::new();
     let mut tab_positions = Vec::new();
     let mut x = area.x;
@@ -47,11 +48,13 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
         let style = if i == app.active_tab {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.tab_active_fg)
+                .bg(theme.tab_active_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+            Style::default()
+                .fg(theme.tab_inactive_fg)
+                .bg(theme.tab_inactive_bg)
         };
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
@@ -61,7 +64,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Hint
     spans.push(Span::styled(
         " Ctrl-T:new  Ctrl-W:close  Ctrl-←→:switch",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.border),
     ));
 
     app.mouse_areas.tab_bar = Some((area.x, area.y, area.width, area.height));
@@ -75,7 +78,7 @@ fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(Span::styled(
         format!(" {breadcrumb}"),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(app.theme.breadcrumb)
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(Paragraph::new(line), area);
@@ -103,20 +106,24 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_parent_pane(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let items: Vec<ListItem> = app
         .parent_entries()
         .iter()
         .enumerate()
         .map(|(i, entry)| {
             let style = if i == app.parent_cursor() {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg)
             } else {
-                entry_style(entry)
+                entry_style_themed(entry, theme)
             };
             ListItem::new(entry_display_name(entry)).style(style)
         })
         .collect();
-    let block = Block::default().borders(Borders::RIGHT).title("Parent");
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .title("Parent")
+        .border_style(Style::default().fg(theme.border));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
@@ -133,6 +140,7 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_entries();
     let cursor = app.cursor();
     let selected_set = app.selected().clone();
+    let theme = app.theme.clone();
 
     let items: Vec<ListItem> = visible
         .iter()
@@ -141,12 +149,12 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
             let selected = selected_set.contains(&entry.path);
             let is_cursor = i == cursor;
             let mut style = if is_cursor {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg)
             } else {
-                entry_style(entry)
+                entry_style_themed(entry, &theme)
             };
             if selected {
-                style = style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+                style = style.add_modifier(Modifier::BOLD).fg(theme.selected);
             }
 
             let mut name = entry_display_name(entry);
@@ -165,7 +173,10 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "Files".to_string()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(theme.border));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
@@ -173,6 +184,7 @@ fn draw_current_pane(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_tree_pane(f: &mut Frame, app: &App, area: Rect) {
     let selected_set = app.selected().clone();
     let tree_cursor = app.tab().tree_cursor;
+    let theme = &app.theme;
 
     let items: Vec<ListItem> = app
         .tab()
@@ -183,12 +195,12 @@ fn draw_tree_pane(f: &mut Frame, app: &App, area: Rect) {
             let is_cursor = i == tree_cursor;
             let selected = selected_set.contains(&node.entry.path);
             let mut style = if is_cursor {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg)
             } else {
-                entry_style(&node.entry)
+                entry_style_themed(&node.entry, theme)
             };
             if selected {
-                style = style.add_modifier(Modifier::BOLD).fg(Color::Yellow);
+                style = style.add_modifier(Modifier::BOLD).fg(theme.selected);
             }
 
             let indent = "  ".repeat(node.depth);
@@ -211,12 +223,16 @@ fn draw_tree_pane(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let block = Block::default().borders(Borders::ALL).title("🌳 Tree");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("🌳 Tree")
+        .border_style(Style::default().fg(theme.border));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
 
 fn draw_search_results(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let visible_height = area.height.saturating_sub(2) as usize; // borders
     let scroll = if app.search_cursor >= visible_height {
         app.search_cursor - visible_height + 1
@@ -239,37 +255,46 @@ fn draw_search_results(f: &mut Frame, app: &App, area: Rect) {
                 result.line_text.trim()
             );
             let style = if is_cursor {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+                Style::default()
+                    .fg(theme.cursor_fg)
+                    .bg(theme.search_highlight)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.fg)
             };
             ListItem::new(text).style(style)
         })
         .collect();
 
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        "🔍 Search Results ({} matches)",
-        app.search_results.len()
-    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            "🔍 Search Results ({} matches)",
+            app.search_results.len()
+        ))
+        .border_style(Style::default().fg(theme.border));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
 
 fn draw_preview_pane(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let lines: Vec<Line> = app
         .preview_lines()
         .iter()
         .map(|pl| {
             let color = match pl.style {
-                crate::preview::PreviewStyle::Header => Color::Yellow,
-                crate::preview::PreviewStyle::Directory => Color::Blue,
-                crate::preview::PreviewStyle::LineNumber => Color::DarkGray,
-                crate::preview::PreviewStyle::Normal => Color::White,
+                crate::preview::PreviewStyle::Header => theme.preview_header,
+                crate::preview::PreviewStyle::Directory => theme.directory,
+                crate::preview::PreviewStyle::LineNumber => theme.preview_line_no,
+                crate::preview::PreviewStyle::Normal => theme.fg,
             };
             Line::from(Span::styled(pl.text.clone(), Style::default().fg(color)))
         })
         .collect();
-    let block = Block::default().borders(Borders::LEFT).title("Preview");
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .title("Preview")
+        .border_style(Style::default().fg(theme.border));
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
@@ -300,8 +325,9 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         String::new()
     };
+    let theme = &app.theme;
     f.render_widget(
-        Paragraph::new(info).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Paragraph::new(info).style(Style::default().bg(theme.status_bg).fg(theme.status_fg)),
         rows[0],
     );
 
@@ -340,13 +366,29 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
             app.sort_by(),
         )
     };
+    // Add undo info to status when idle
+    let undo_info = if app.input_mode == InputMode::Normal && app.status_message.is_none() {
+        let u = app.undo_stack.undo_count();
+        let r = app.undo_stack.redo_count();
+        if u > 0 || r > 0 {
+            format!(" │ Undo:{u} Redo:{r}")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     f.render_widget(
-        Paragraph::new(status).style(Style::default().bg(Color::Blue).fg(Color::White)),
+        Paragraph::new(format!("{status}{undo_info}"))
+            .style(Style::default().bg(theme.status_bg).fg(theme.status_fg)),
         rows[1],
     );
 }
 
+#[allow(dead_code)]
 fn entry_style(entry: &FileEntry) -> Style {
+    // Fallback — callers with theme access should use entry_style_themed
     if entry.is_symlink {
         Style::default().fg(Color::Cyan)
     } else if entry.is_dir {
@@ -355,6 +397,18 @@ fn entry_style(entry: &FileEntry) -> Style {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
+    }
+}
+
+fn entry_style_themed(entry: &FileEntry, theme: &crate::theme::Theme) -> Style {
+    if entry.is_symlink {
+        Style::default().fg(theme.symlink)
+    } else if entry.is_dir {
+        Style::default()
+            .fg(theme.directory)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.file)
     }
 }
 
