@@ -91,6 +91,11 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    if app.dual_pane {
+        draw_dual_panes(f, app, area);
+        return;
+    }
+
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -103,6 +108,90 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
     draw_parent_pane(f, app, panes[0]);
     draw_current_pane(f, app, panes[1]);
     draw_preview_pane(f, app, panes[2]);
+}
+
+fn draw_dual_panes(f: &mut Frame, app: &mut App, area: Rect) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Left pane = main tab
+    draw_dual_file_pane(f, app, panes[0], false);
+    // Right pane = dual tab
+    draw_dual_file_pane(f, app, panes[1], true);
+}
+
+fn draw_dual_file_pane(f: &mut Frame, app: &mut App, area: Rect, is_right: bool) {
+    let tab = if is_right {
+        match app.dual_tab.as_ref() {
+            Some(t) => t,
+            None => return,
+        }
+    } else {
+        &app.tabs[app.active_tab]
+    };
+    let is_active = if is_right {
+        app.dual_right_active
+    } else {
+        !app.dual_right_active
+    };
+    let theme = &app.theme;
+
+    // Set mouse area for the active pane
+    if is_active {
+        app.mouse_areas.current_pane = Some((area.x, area.y, area.width, area.height));
+    }
+
+    let visible = tab.visible_entries();
+    let cursor = tab.cursor;
+    let selected_set = &tab.selected;
+
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let selected = selected_set.contains(&entry.path);
+            let is_cursor = i == cursor;
+            let mut style = if is_cursor && is_active {
+                Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg)
+            } else if is_cursor {
+                Style::default().fg(theme.cursor_fg).bg(theme.border)
+            } else {
+                entry_style_themed(entry, theme)
+            };
+            if selected {
+                style = style.add_modifier(Modifier::BOLD).fg(theme.selected);
+            }
+            let mut name = entry_display_name(entry);
+            if let Some(gs) = &entry.git_status {
+                name = format!("[{}] {}", gs.icon(), name);
+            }
+            if selected && !is_cursor {
+                name = format!("* {name}");
+            }
+            ListItem::new(name).style(style)
+        })
+        .collect();
+
+    let dir_name = tab
+        .current_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let indicator = if is_active { "▶ " } else { "  " };
+    let title = format!("{indicator}{dir_name}");
+    let border_color = if is_active {
+        theme.cursor_bg
+    } else {
+        theme.border
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(border_color));
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
 }
 
 fn draw_parent_pane(f: &mut Frame, app: &App, area: Rect) {

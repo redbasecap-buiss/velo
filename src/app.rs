@@ -310,6 +310,22 @@ pub struct App {
     pub theme: Theme,
     /// Undo/redo stack
     pub undo_stack: UndoStack,
+    /// Dual-pane mode
+    pub dual_pane: bool,
+    /// The "other" pane tab (separate from tabs[])
+    pub dual_tab: Option<Tab>,
+    /// Which pane is active in dual mode: false=left (main tab), true=right (dual_tab)
+    pub dual_right_active: bool,
+    /// Archive compression format choice
+    #[allow(dead_code)]
+    pub compress_mode: Option<CompressFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CompressFormat {
+    Zip,
+    TarGz,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -351,17 +367,67 @@ impl App {
             theme_name: config.theme,
             theme: Theme::from_name(config.theme),
             undo_stack: UndoStack::new(),
+            dual_pane: false,
+            dual_tab: None,
+            dual_right_active: false,
+            compress_mode: None,
         })
     }
 
-    /// Access the active tab
+    /// Access the active tab (respects dual-pane focus)
     pub fn tab(&self) -> &Tab {
+        if self.dual_pane && self.dual_right_active {
+            self.dual_tab
+                .as_ref()
+                .unwrap_or(&self.tabs[self.active_tab])
+        } else {
+            &self.tabs[self.active_tab]
+        }
+    }
+
+    /// Access the active tab mutably (respects dual-pane focus)
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        if self.dual_pane && self.dual_right_active {
+            self.dual_tab
+                .as_mut()
+                .unwrap_or(&mut self.tabs[self.active_tab])
+        } else {
+            &mut self.tabs[self.active_tab]
+        }
+    }
+
+    /// Access the left (main) tab
+    #[allow(dead_code)]
+    pub fn left_tab(&self) -> &Tab {
         &self.tabs[self.active_tab]
     }
 
-    /// Access the active tab mutably
-    pub fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
+    /// Access the right (dual) tab
+    #[allow(dead_code)]
+    pub fn right_tab(&self) -> Option<&Tab> {
+        self.dual_tab.as_ref()
+    }
+
+    /// Toggle dual-pane mode
+    pub fn toggle_dual_pane(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.dual_pane = !self.dual_pane;
+        if self.dual_pane && self.dual_tab.is_none() {
+            let dir = self.tabs[self.active_tab].current_dir.clone();
+            let show_hidden = self.tabs[self.active_tab].show_hidden;
+            let sort_by = self.tabs[self.active_tab].sort_by;
+            self.dual_tab = Some(Tab::new(dir, show_hidden, sort_by)?);
+        }
+        if !self.dual_pane {
+            self.dual_right_active = false;
+        }
+        Ok(())
+    }
+
+    /// Switch focus between dual panes
+    pub fn dual_switch_pane(&mut self) {
+        if self.dual_pane {
+            self.dual_right_active = !self.dual_right_active;
+        }
     }
 
     // Convenience delegations for backward compat in UI code
@@ -929,6 +995,88 @@ impl App {
                 }
                 Err(e) => self.status_message = Some(e),
             },
+            KeyCode::Char('D') => {
+                self.toggle_dual_pane()?;
+                let mode = if self.dual_pane { "ON" } else { "OFF" };
+                self.status_message = Some(format!("Dual pane: {mode} (Tab to switch)"));
+            }
+            KeyCode::Tab => {
+                if self.dual_pane {
+                    self.dual_switch_pane();
+                    let side = if self.dual_right_active {
+                        "Right"
+                    } else {
+                        "Left"
+                    };
+                    self.status_message = Some(format!("Active pane: {side}"));
+                }
+            }
+            KeyCode::Char('X') => {
+                // Extract archive
+                if let Some(entry) = self.tab().selected_entry().cloned() {
+                    if file_ops::is_archive(&entry.path) {
+                        let dest = self.tab().current_dir.clone();
+                        match file_ops::extract_archive(&entry.path, &dest) {
+                            Ok(files) => {
+                                self.status_message = Some(format!(
+                                    "Extracted {} entries from {}",
+                                    files.len(),
+                                    entry.name
+                                ));
+                                self.tab_mut().refresh()?;
+                                // Also refresh other pane if in dual mode
+                                if self.dual_pane {
+                                    if self.dual_right_active {
+                                        self.tabs[self.active_tab].refresh()?;
+                                    } else if let Some(dt) = self.dual_tab.as_mut() {
+                                        let _ = dt.refresh();
+                                    }
+                                }
+                            }
+                            Err(e) => self.status_message = Some(format!("Extract error: {e}")),
+                        }
+                    } else {
+                        self.status_message =
+                            Some("Not an archive (zip/tar/tar.gz/tgz)".to_string());
+                    }
+                }
+            }
+            KeyCode::Char('Z') => {
+                // Compress selected files to zip
+                let sources: Vec<PathBuf> = if self.tab().selected.is_empty() {
+                    self.tab()
+                        .selected_entry()
+                        .map(|e| vec![e.path.clone()])
+                        .unwrap_or_default()
+                } else {
+                    self.tab().selected.iter().cloned().collect()
+                };
+                if sources.is_empty() {
+                    self.status_message = Some("Nothing to compress".to_string());
+                } else {
+                    let base_name = if sources.len() == 1 {
+                        sources[0]
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("archive")
+                            .to_string()
+                    } else {
+                        "archive".to_string()
+                    };
+                    let dest = self.tab().current_dir.join(format!("{base_name}.zip"));
+                    match file_ops::compress_zip(&sources, &dest) {
+                        Ok(count) => {
+                            self.status_message = Some(format!(
+                                "Compressed {count} item(s) → {}",
+                                dest.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                            self.tab_mut().selected.clear();
+                            self.tab_mut().refresh()?;
+                        }
+                        Err(e) => self.status_message = Some(format!("Compress error: {e}")),
+                    }
+                }
+            }
             _ => {}
         }
         Ok(false)
@@ -1573,6 +1721,125 @@ mod tests {
         app.tab_mut().toggle_tree_mode();
         let entry = app.tab().selected_tree_entry();
         assert!(entry.is_some());
+    }
+
+    // Dual-pane tests
+    #[test]
+    fn test_dual_pane_toggle() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        assert!(!app.dual_pane);
+        app.toggle_dual_pane().unwrap();
+        assert!(app.dual_pane);
+        assert!(app.dual_tab.is_some());
+        app.toggle_dual_pane().unwrap();
+        assert!(!app.dual_pane);
+        assert!(!app.dual_right_active);
+    }
+
+    #[test]
+    fn test_dual_pane_switch() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        app.toggle_dual_pane().unwrap();
+        assert!(!app.dual_right_active);
+        app.dual_switch_pane();
+        assert!(app.dual_right_active);
+        app.dual_switch_pane();
+        assert!(!app.dual_right_active);
+    }
+
+    #[test]
+    fn test_dual_pane_tab_access() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        let mut app = make_app(&tmp);
+        app.toggle_dual_pane().unwrap();
+        // Left pane active - tab() returns main tab
+        let left_dir = app.tab().current_dir.clone();
+        // Switch to right
+        app.dual_switch_pane();
+        let right_dir = app.tab().current_dir.clone();
+        // Both should start at same dir
+        assert_eq!(left_dir, right_dir);
+    }
+
+    #[test]
+    fn test_dual_switch_no_effect_without_dual() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        app.dual_switch_pane(); // should be no-op
+        assert!(!app.dual_right_active);
+    }
+
+    // Archive tests
+    #[test]
+    fn test_is_archive() {
+        assert!(file_ops::is_archive(std::path::Path::new("test.zip")));
+        assert!(file_ops::is_archive(std::path::Path::new("test.tar.gz")));
+        assert!(file_ops::is_archive(std::path::Path::new("test.tgz")));
+        assert!(file_ops::is_archive(std::path::Path::new("test.tar")));
+        assert!(!file_ops::is_archive(std::path::Path::new("test.txt")));
+    }
+
+    #[test]
+    fn test_compress_and_extract_zip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("a.txt"), "hello").unwrap();
+        fs::write(dir.join("b.txt"), "world").unwrap();
+        let archive = dir.join("test.zip");
+        let sources = vec![dir.join("a.txt"), dir.join("b.txt")];
+        let count = file_ops::compress_zip(&sources, &archive).unwrap();
+        assert_eq!(count, 2);
+        assert!(archive.exists());
+        // Extract
+        let extract_dir = dir.join("extracted");
+        fs::create_dir(&extract_dir).unwrap();
+        let files = file_ops::extract_archive(&archive, &extract_dir).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            fs::read_to_string(extract_dir.join("a.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn test_compress_and_extract_tar_gz() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        fs::write(dir.join("c.txt"), "data").unwrap();
+        let archive = dir.join("test.tar.gz");
+        let sources = vec![dir.join("c.txt")];
+        let count = file_ops::compress_tar_gz(&sources, &archive).unwrap();
+        assert_eq!(count, 1);
+        assert!(archive.exists());
+        let extract_dir = dir.join("out");
+        fs::create_dir(&extract_dir).unwrap();
+        let files = file_ops::extract_archive(&archive, &extract_dir).unwrap();
+        assert!(!files.is_empty());
+    }
+
+    #[test]
+    fn test_compress_dir_zip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let sub = dir.join("mydir");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("inner.txt"), "inside").unwrap();
+        let archive = dir.join("dir.zip");
+        let count = file_ops::compress_zip(&[sub], &archive).unwrap();
+        assert!(count >= 1);
+        assert!(archive.exists());
+    }
+
+    #[test]
+    fn test_extract_not_archive() {
+        let result = file_ops::extract_archive(
+            std::path::Path::new("test.txt"),
+            std::path::Path::new("/tmp"),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

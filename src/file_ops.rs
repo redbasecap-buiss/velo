@@ -209,6 +209,170 @@ fn search_recursive_inner(
     }
 }
 
+/// Check if a path is an extractable archive
+pub fn is_archive(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "zip" | "gz" | "tar" | "tgz")
+        || path.to_string_lossy().to_lowercase().ends_with(".tar.gz")
+}
+
+/// Extract an archive (zip, tar.gz, tar, tgz) into dest_dir
+pub fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
+    let name = archive.to_string_lossy().to_lowercase();
+    if name.ends_with(".zip") {
+        extract_zip(archive, dest_dir)
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(archive, dest_dir)
+    } else if name.ends_with(".tar") {
+        extract_tar(archive, dest_dir)
+    } else if name.ends_with(".gz") {
+        extract_gz(archive, dest_dir)
+    } else {
+        Err("Unsupported archive format".to_string())
+    }
+}
+
+fn extract_zip(archive: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
+    let file = fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut extracted = Vec::new();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        let out_path = dest_dir.join(&name);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out = fs::File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        }
+        extracted.push(name);
+    }
+    Ok(extracted)
+}
+
+fn extract_tar_gz(archive: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
+    let file = fs::File::open(archive).map_err(|e| e.to_string())?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(gz);
+    let mut extracted = Vec::new();
+    for entry in tar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
+        let name = path.display().to_string();
+        entry.unpack_in(dest_dir).map_err(|e| e.to_string())?;
+        extracted.push(name);
+    }
+    Ok(extracted)
+}
+
+fn extract_tar(archive: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
+    let file = fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut tar = tar::Archive::new(file);
+    let mut extracted = Vec::new();
+    for entry in tar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
+        let name = path.display().to_string();
+        entry.unpack_in(dest_dir).map_err(|e| e.to_string())?;
+        extracted.push(name);
+    }
+    Ok(extracted)
+}
+
+fn extract_gz(archive: &Path, dest_dir: &Path) -> Result<Vec<String>, String> {
+    let file = fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut gz = flate2::read::GzDecoder::new(file);
+    let stem = archive
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let out_path = dest_dir.join(stem);
+    let mut out = fs::File::create(&out_path).map_err(|e| e.to_string())?;
+    std::io::copy(&mut gz, &mut out).map_err(|e| e.to_string())?;
+    Ok(vec![stem.to_string()])
+}
+
+/// Compress files into a zip archive at dest_path
+pub fn compress_zip(paths: &[PathBuf], dest_path: &Path) -> Result<usize, String> {
+    let file = fs::File::create(dest_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut count = 0;
+    for path in paths {
+        if path.is_dir() {
+            count += add_dir_to_zip(&mut zip, path, path.parent().unwrap_or(path), options)?;
+        } else {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            zip.start_file(name, options).map_err(|e| e.to_string())?;
+            let content = fs::read(path).map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut zip, &content).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<fs::File>,
+    dir: &Path,
+    base: &Path,
+    options: zip::write::SimpleFileOptions,
+) -> Result<usize, String> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(base)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .to_string();
+        if path.is_dir() {
+            zip.add_directory(format!("{rel}/"), options)
+                .map_err(|e| e.to_string())?;
+            count += add_dir_to_zip(zip, &path, base, options)?;
+        } else {
+            zip.start_file(&rel, options).map_err(|e| e.to_string())?;
+            let content = fs::read(&path).map_err(|e| e.to_string())?;
+            std::io::Write::write_all(zip, &content).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Compress files into a tar.gz archive at dest_path
+#[allow(dead_code)]
+pub fn compress_tar_gz(paths: &[PathBuf], dest_path: &Path) -> Result<usize, String> {
+    let file = fs::File::create(dest_path).map_err(|e| e.to_string())?;
+    let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    let mut count = 0;
+    for path in paths {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        if path.is_dir() {
+            tar.append_dir_all(name, path).map_err(|e| e.to_string())?;
+            count += 1; // count dir as 1
+        } else {
+            let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+            tar.append_file(name, &mut f).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    tar.finish().map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
