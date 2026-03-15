@@ -542,6 +542,7 @@ mod tests {
         assert_eq!(format_size(1024), "1.0 KB");
         assert_eq!(format_size(1048576), "1.0 MB");
         assert_eq!(format_size(1073741824), "1.0 GB");
+        assert_eq!(format_size(1099511627776), "1.0 TB");
     }
 
     #[test]
